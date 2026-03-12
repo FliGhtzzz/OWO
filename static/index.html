@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Guessr — 自然語言檔案搜尋</title>
+    <meta name="description" content="Use natural language to search your local files">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=12">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <i data-lucide="search" class="logo-icon"></i>
+                <h1>File Guessr<small style="font-size: 0.6rem; opacity: 0.5; margin-left: 4px;">v1.1</small></h1>
+            </div>
+            <div class="header-actions">
+                <button id="btn-status" class="btn btn-ghost" onclick="checkHealth()">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span id="status-text">Checking...</span>
+                </button>
+                <button class="btn btn-ghost" onclick="showPanel('settings')">
+                    <i data-lucide="settings-2" class="icon-sm"></i>
+                    設定
+                </button>
+            </div>
+        </header>
+
+        <!-- Search Section -->
+        <main class="main">
+            <div class="search-container">
+                <div class="search-box">
+                    <input type="text" id="search-input" placeholder="搜尋你的檔案..." autocomplete="off">
+                    <label class="btn-attach" id="btn-attach" title="附加檔案搜尋">
+                        <i data-lucide="paperclip"></i>
+                        <input type="file" id="search-file-input" style="display:none" onchange="onFileAttached(this)">
+                    </label>
+                    <button class="btn btn-primary" id="btn-search" onclick="doSearch()">
+                        搜尋
+                    </button>
+                </div>
+
+                <!-- Attached file preview -->
+                <div class="attached-file" id="attached-file" style="display:none;">
+                    <i data-lucide="file-text" class="attached-icon"></i>
+                    <span class="attached-name" id="attached-name"></span>
+                    <button class="btn-remove-attach" onclick="removeAttachment()" title="移除附件">
+                        <i data-lucide="x" class="icon-xs"></i>
+                    </button>
+                </div>
+
+                <div class="search-meta" id="search-meta"></div>
+            </div>
+
+            <!-- Results -->
+            <div class="results" id="results">
+                <div class="empty-state" id="empty-state">
+                    <div class="empty-illustration">
+                        <i data-lucide="folder-search" size="64"></i>
+                    </div>
+                    <h2>開始搜尋你的檔案</h2>
+                    <p>在「設定」中新增資料夾後，開始搜尋檔案</p>
+                    <p class="text-muted" style="margin-top:12px;font-size:0.85rem">
+                        你也可以拖放檔案到搜尋框，讓 AI 幫你找相似的內容
+                    </p>
+                </div>
+            </div>
+        </main>
+
+        <!-- Settings Panel (Overlay) -->
+        <div class="panel-overlay" id="panel-overlay" onclick="hidePanel()"></div>
+        <div class="panel" id="panel-settings">
+            <div class="panel-header">
+                <div class="title-with-icon">
+                    <i data-lucide="settings" class="icon-md"></i>
+                    <h2>設定</h2>
+                </div>
+                <button class="btn-close" onclick="hidePanel()">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="panel-body">
+                <!-- Add New Folder -->
+                <div class="card">
+                    <div class="card-header">
+                        <i data-lucide="folder-plus" class="icon-sm"></i>
+                        <h3>新增資料夾</h3>
+                    </div>
+                    <div class="folder-add-row">
+                        <button class="btn btn-outline" id="btn-browse" onclick="browseFolderPath()">
+                            選擇資料夾
+                        </button>
+                        <div class="selected-folder-container">
+                            <span class="selected-folder-path" id="selected-folder-path">尚未選擇</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary btn-start-index" id="btn-index" onclick="startIndex()" disabled>
+                        開始索引
+                    </button>
+                </div>
+
+                <!-- Progress -->
+                <div class="card" id="progress-card" style="display:none;">
+                    <div class="card-header">
+                        <i data-lucide="loader-2" class="icon-sm animate-spin"></i>
+                        <h3>索引進度</h3>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div class="progress-info">
+                        <span id="progress-text">0 / 0</span>
+                        <span id="progress-file" class="text-truncate">-</span>
+                    </div>
+                    <div class="progress-info">
+                        <span id="progress-time">已耗時: 0s</span>
+                        <span id="progress-errors" class="text-error"></span>
+                    </div>
+                </div>
+
+                <!-- LLM Model Selection -->
+                <div class="card">
+                    <div class="card-header">
+                        <i data-lucide="cpu" class="icon-sm"></i>
+                        <h3>AI 模型設定</h3>
+                    </div>
+                    <div class="folder-add-row">
+                        <div style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 4px;">選擇 Ollama 模型</div>
+                        <select id="select-llm-model" class="btn btn-outline"
+                            style="width: 100%; text-align: left; justify-content: flex-start;"
+                            onchange="updateLLMModel()">
+                            <option value="">載入中...</option>
+                        </select>
+                    </div>
+                    <p class="text-muted" style="font-size: 0.75rem; margin-top: 8px;">
+                        這將影響關鍵字抽取、圖片描述與搜尋擴展所使用的模型。
+                    </p>
+                </div>
+
+                <!-- Watched Folders -->
+                <div class="card">
+                    <div class="card-header">
+                        <i data-lucide="monitor" class="icon-sm"></i>
+                        <h3>已監控資料夾</h3>
+                    </div>
+                    <div id="watched-folders-list" class="watched-list">
+                        <p class="text-muted">載入中...</p>
+                    </div>
+                </div>
+
+                <!-- Stats -->
+                <div class="card">
+                    <div class="card-header">
+                        <i data-lucide="bar-chart-3" class="icon-sm"></i>
+                        <h3>索引統計</h3>
+                    </div>
+                    <div id="stats-content">
+                        <p class="text-muted">載入中...</p>
+                    </div>
+                    <div class="card-actions">
+                        <button class="btn btn-ghost btn-xs" onclick="loadStats()">
+                            <i data-lucide="refresh-cw" class="icon-xs"></i>
+                            重新整理
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Diagnostics -->
+                <div class="card">
+                    <div class="card-header">
+                        <i data-lucide="shield-alert" class="icon-sm"></i>
+                        <h3>診斷工具</h3>
+                    </div>
+                    <div class="diag-btn-group">
+                        <button class="btn btn-ghost diag-btn" onclick="showAiLogs()">
+                            <i data-lucide="file-text" class="icon-sm"></i>
+                            查看 AI 引擎日誌
+                        </button>
+                        <div class="diag-divider"></div>
+                        <button class="btn btn-ghost diag-btn diag-btn-danger" onclick="clearIndex()">
+                            <i data-lucide="trash-2" class="icon-sm"></i>
+                            清除所有索引資料
+                        </button>
+                    </div>
+                    <p class="text-muted" style="font-size:0.75rem; margin-top:10px;">
+                        清除後需重新索引所有資料夾
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- File Details Modal -->
+        <div class="panel-overlay" id="details-overlay" onclick="closeDetailsModal()"></div>
+        <div class="modal-center" id="panel-details">
+            <div class="modal-header">
+                <div class="title-with-icon">
+                    <i data-lucide="info" class="icon-md"></i>
+                    <h2 id="details-title" class="text-truncate">檔案詳情</h2>
+                </div>
+                <button class="btn-close" onclick="closeDetailsModal()">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="details-section">
+                    <span class="details-label">路徑</span>
+                    <div id="details-path" class="details-path-box"></div>
+                </div>
+                <div class="details-section" style="margin-top: 32px;">
+                    <span class="details-label">AI 內容總結</span>
+                    <div id="details-summary" class="details-summary-text"></div>
+                </div>
+                <div class="details-section" style="margin-top: 32px;">
+                    <span class="details-label">完整關鍵字清單 (<span id="details-keyword-count">0</span>)</span>
+                    <div id="details-keywords" class="result-tags"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=12"></script>
+    <script>
+        // Initialize Lucide icons on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            lucide.createIcons();
+        });
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.env
+
+# Database
+file_guessr.db
+*.sqlite3
+*.db
+file_guessr.db-wal
+file_guessr.db-shm
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+launcher.log
+
+# Debug & Temporary scripts
+debug_bg.py
+SUCCESS.txt
+DIR_WORKS.txt
+diagnose.py
+diagnose_stale.py
+debug_run.bat
+run_diagnose.bat
+run.bat
+fix_environment.bat
+*.tmp
