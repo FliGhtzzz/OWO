@@ -1,0 +1,61 @@
+{
+  "original_query": "ZOO",
+  "expanded_query": "zoo zoological garden wildlife park animal exhibit conservation endangered species",
+  "hits": [
+    {
+      "rank": 1,
+      "score": 216.50034,
+      "file_name": "IMG_20260127_111030.jpg",
+      "keywords": "zebra, gravel path, chain link fence, greenery, outdoor enclosure, black and white stripes, wildlife park, zoo, walking, natural lighting, vegetation, animal, wildlife, enclosure, path, fence, stripes, outdoor, gravel, greens",
+      "summary": "A zebra is walking on a gravel path in an outdoor enclosure surrounded by greenery and a chain-link fence. The zebra's black and white stripes are clearly visible, and the setting appears to be a zoo or wildlife park.",
+      "top_features": [
+        {
+          "value": 134.3735,
+          "description": "max of:"
+        },
+        {
+          "value": 54.18294,
+          "description": "sum of:"
+        },
+        {
+          "value": 27.943897,
+          "description": "sum of:"
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "score": 203.62466,
+      "file_name": "IMG_20260127_111543.jpg",
+      "keywords": "camels, outdoor enclosure, dirt path, greenery, trees, zoo, wildlife park, metal roof, brown, green, natural lighting, animal habitat",
+      "summary": "The image depicts three camels in an outdoor enclosure, surrounded by greenery and trees. The camels are standing on a dirt path, with one camel facing the camera and the other two facing away. The setting appears to be a zoo or wildlife park, with a metal roof structure visible in the background.",
+      "top_features": [
+        {
+          "value": 119.74284,
+          "description": "max of:"
+        },
+        {
+          "value": 58.98047,
+          "description": "sum of:"
+        },
+        {
+          "value": 24.90135,
+          "description": "sum of:"
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "score": 38.481224,
+      "file_name": "IMG_20260127_111140.jpg",
+      "keywords": "giraffe, zoo enclosure, metal basket, greenery, brown and white spots, dirt ground, rocky wall, feeding, wildlife, animal care, natural habitat, long neck, spotted coat, outdoor setting, natural light",
+      "summary": "A giraffe in a zoo enclosure is reaching its head into a hanging metal basket filled with greenery, likely for feeding. The giraffe has a distinctive brown and white spotted coat and is standing on a dirt ground with a rocky wall in the background.",
+      "top_features": [
+        {
+          "value": 38.481224,
+          "description": "sum of:"
+        }
+      ]
+    }
+  ]
+}

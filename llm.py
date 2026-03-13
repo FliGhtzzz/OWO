@@ -139,17 +139,22 @@ def _clean_keyword_list(keywords: Union[list[str], str, Any]) -> list[str]:
         return []
         
     clean_list = []
+    seen = set()
     for kw in keywords:
         if not kw: continue
-        kw = str(kw)
+        kw = str(kw).lower() # convert to lowercase for deduplication
         # Remove all common code/syntax symbols
         kw_clean = re.sub(r'[{}()[\];<>#=*&%@!_.,"\'+-/]', ' ', kw)
         # Collapse spaces
         kw_clean = ' '.join(kw_clean.split())
-        # Filter if it still looks like code or is too short
-        if kw_clean and not _is_likely_code(kw_clean) and len(kw_clean) > 1:
-            clean_list.append(kw_clean)
-    return clean_list
+        # Filter if it still looks like code or is too short.
+        # Allow single-character keywords if they are non-ASCII (e.g. Chinese characters).
+        is_short_ascii = len(kw_clean) <= 1 and all(ord(c) < 128 for c in kw_clean)
+        if kw_clean and not _is_likely_code(kw_clean) and not is_short_ascii and len(kw_clean) < 40:
+            if kw_clean not in seen:
+                seen.add(kw_clean)
+                clean_list.append(kw_clean)
+    return clean_list[:50] # Strictly enforce max 50 keywords in the code as well
 
 
 def _truncate_keywords(keywords: str, max_chars: int = 1500) -> str:
@@ -232,7 +237,17 @@ def _cleanup_expansion_result(response: str, user_query: str) -> str:
     # Remove extra spaces
     best_line = ' '.join(best_line.split())
     
-    return best_line
+    # Simple deduplication of words in the expanded query
+    words = best_line.split()
+    seen = set()
+    deduped = []
+    for w in words:
+        wl = w.lower()
+        if wl not in seen:
+            seen.add(wl)
+            deduped.append(w)
+            
+    return ' '.join(deduped[:30]) # keep max 30 words for search expansion
 
 
 def _parse_json_response(text: str) -> dict:
@@ -287,10 +302,15 @@ def _parse_json_response(text: str) -> dict:
 
         if summary and keywords:
             ai_logger.info(f"JSON parsed OK: {len(keywords)} keywords.")
+            # Truncate summary to 600 chars at a sentence boundary
+            if len(summary) > 600:
+                cut = summary[:600]
+                dot = cut.rfind(".")
+                summary = (cut[:dot + 1] if dot > 200 else cut).strip()
             return {"summary": summary, "keywords": _clean_keyword_list(keywords)}
 
         if keywords:  # have keywords but no summary
-            summary = text[:500] + "..." if len(text) > 500 else text
+            summary = text[:300] + "..." if len(text) > 300 else text
             ai_logger.info(f"JSON partial: {len(keywords)} keywords, no summary.")
             return {"summary": summary, "keywords": _clean_keyword_list(keywords)}
 
@@ -326,10 +346,17 @@ def _parse_json_response(text: str) -> dict:
     return result
 
 
+# Custom exception for LLM failures - ensures callers never get polluted data
+class LLMFailedError(Exception):
+    """Raised when LLM fails to generate content after all retries."""
+    pass
+
+
 async def extract_keywords(text: str, file_name: str) -> dict:
     """
     Extract keywords and summary from text content.
     Returns: {"summary": str, "keywords": [str]}
+    Raises LLMFailedError if LLM fails after 2 attempts - caller must handle.
     """
     prompt = f"""You are a precise search indexing engine. Analyze the file below and extract high-quality metadata for search.
 File name: {file_name}
@@ -341,78 +368,49 @@ RULES:
 - Respond ONLY with a valid JSON object. No markdown, no code fences, no extra text.
 - All output must be in English. Translate non-English concepts but preserve original proper nouns as extra keywords.
 - Summary: 2-4 sentences. Be SPECIFIC: mention exact algorithms, methods, topics, names, places. No vague filler.
-- Keywords: Select the most critical keywords, MAXIMUM 50 keywords. Each keyword MUST be concise (under 30 characters). MAXIMUM 50 KEYWORDS TOTAL. DO NOT GENERATE MORE.
+- Keywords: Select the most critical keywords, MAXIMUM 30 keywords. Each keyword MUST be concise (under 30 characters). MAXIMUM 30 KEYWORDS TOTAL. DO NOT GENERATE MORE.
   - INCLUDE: algorithm names, data structures, proper nouns, technical terms, domain-specific concepts, file-specific topics
+  - FOR ANIMALS, PLANTS, OR SPECIFIC OBJECTS: Always include the general category/hypernym (e.g., if you find "Dachshund", also include "dog"; if "Oak", include "tree").
   - EXCLUDE generic filler words: "code", "data", "file", "list", "function", "example", "implementation", "snippet", "programming", "computer", "method", "value", "result", "output", "input", "variable"
+  - EXTREMELY IMPORTANT: Every keyword must be UNIQUE. Avoid exact duplicates, but include both specific terms and their general categories (hypernyms).
   - Multi-word specific terms MUST stay together: "binary search", "machine learning", "dynamic programming"
   - Proper nouns in original language are OK if they add value: "台北101", "東京"
 
 OUTPUT FORMAT (JSON ONLY):
-{{"summary": "Specific description of what this file is actually about", "keywords": ["specific-term1", "specific-term2"]}}
+{{"summary": "Specific description of what this file is actually about", "keywords": ["specific-term1", "specific-term2", "general-category"]}}
 
 EXTREMELY IMPORTANT: STOP GENERATING immediately after the closing brace "}}". Do not append any trailing text."""
 
-    try:
-        ai_logger.info(f"Extracting keywords for {file_name}...")
+    ai_logger.info(f"Extracting keywords for {file_name}...")
+    for attempt in range(2):
         try:
-            response = await _chat(prompt, num_predict=300)
+            # 20s timeout per attempt
+            response = await _chat(prompt, num_predict=300, timeout=20.0)
             result = _parse_json_response(response)
-        except (asyncio.TimeoutError, httpx.TimeoutException):
-            ai_logger.warning(f"Timeout extracting keywords for {file_name}. Using smart fallback.")
-            raise Exception("Indexing timeout")
-
-        # Ensure required fields
-        if "summary" not in result:
-            result["summary"] = ""
-        if "keywords" not in result:
-            result["keywords"] = []
-        return result
-    except Exception as e:
-        ai_logger.error(f"[LLM] Error extracting keywords for {file_name}: {e}")
-        # Smart fallback: derive meaningful keywords from filename and code structure
-        name_stem = os.path.splitext(file_name)[0]
-        ext = os.path.splitext(file_name)[1].lstrip('.')
-        fallback_keywords = [file_name, name_stem]
-        if ext:
-            fallback_keywords.append(ext)
-
-        # Skip common boilerplate syntax tokens that add no search value
-        SKIP_TOKENS = {
-            "include", "define", "using", "namespace", "return", "class",
-            "void", "bool", "true", "false", "endl", "cout", "stdin",
-            "stdio", "string", "vector", "printf", "scanf", "signed",
-            "unsigned", "struct", "const", "while", "break", "continue",
-            "static", "inline", "template", "typename", "nullptr",
-            "bits", "stdc", "fast", "long", "else",
-        }
-        # Prefer words from code comments (likely human-written descriptions)
-        comment_words = re.findall(r'//+\s*([^\n]{1,80})', text[:2000])
-        comment_kws = []
-        for comment in comment_words[:5]:
-            words = re.findall(r'\b[a-zA-Z][a-zA-Z0-9]{3,}\b', comment)
-            comment_kws.extend([w.lower() for w in words if w.lower() not in SKIP_TOKENS])
-
-        if comment_kws:
-            fallback_keywords.extend(comment_kws[:10])
-        else:
-            # Only take longer identifiers that are likely meaningful function/variable names
-            long_words = re.findall(r'\b[a-zA-Z][a-zA-Z0-9_]{5,}\b', text[:2000])
-            unique_words = list(dict.fromkeys(
-                w.lower() for w in long_words if w.lower() not in SKIP_TOKENS
-            ))
-            fallback_keywords.extend(unique_words[:12])
-
-        return {
-            "summary": f"{file_name} — AI summary unavailable (LLM timed out or errored).",
-            "keywords": list(dict.fromkeys(fallback_keywords))
-        }
-
+            
+            # Basic validation
+            if not result.get("summary") and not result.get("keywords"):
+                raise Exception("LLM returned empty or unparseable result")
+                
+            if "summary" not in result:
+                result["summary"] = ""
+            if "keywords" not in result:
+                result["keywords"] = []
+            return result
+        except Exception as e:
+            ai_logger.warning(f"[Attempt {attempt+1}/2] Error for {file_name}: {e}")
+            if attempt == 0:
+                ai_logger.info(f"Retrying {file_name}...")
+                continue
+            # Both attempts failed — raise to prevent database pollution
+            raise LLMFailedError(f"extract_keywords failed for '{file_name}' after 2 attempts") from e
 
 
 async def describe_image(image_path: str, file_name: str) -> dict:
     """
-    Describe an image in extreme detail using vision model.
+    Describe an image using vision model.
     Returns: {"summary": str, "keywords": [str]}
+    Raises LLMFailedError if LLM fails after 2 attempts - caller must handle.
     """
     prompt = f"""You are a precise visual search indexing engine. Analyze this image and extract high-quality metadata.
 File name: {file_name}
@@ -428,44 +426,42 @@ ANALYZE THESE ASPECTS:
 RULES:
 - Respond ONLY with a JSON object. No markdown fences, no extra text.
 - Summary: 2-4 sentences. Be SPECIFIC. Mention the most distinctive elements.
-- Keywords: Select the most critical keywords, MAXIMUM 50 keywords. Each keyword MUST be concise (under 30 characters).
+- Keywords: Select the most critical keywords, MAXIMUM 30 keywords. Each keyword MUST be concise (under 20 characters). 
   - INCLUDE: object names, scene descriptors, transcribed text, proper nouns, colors, actions, mood
+  - FOR ANIMALS, PLANTS, OR SPECIFIC OBJECTS: Always include the general category/hypernym (e.g., if you find "Dachshund", also include "dog").
   - EXCLUDE vague words: "image", "photo", "picture", "file", "background", "scene" (unless scene type is specific like "beach scene")
+  - EXTREMELY IMPORTANT: Each item MUST be unique! Avoid exact duplicates, but include both specific terms and their general categories (hypernyms).
   - Multi-word terms stay together: "Eiffel Tower", "golden retriever", "brick wall"
 - DO NOT hallucinate. Only describe what is actually visible.
 
-FORMAT:
-{{"summary": "Specific description of the image content", "keywords": ["specific-term1", "specific-term2"]}}"""
+OUTPUT FORMAT (JSON ONLY):
+{{"summary": "Specific description of the image content", "keywords": ["specific-term1", "specific-term2", "general-category"]}}
 
-    try:
-        response = await _chat(prompt, image_path=image_path)
-        result = _parse_json_response(response)
-        if "summary" not in result:
-            result["summary"] = ""
-        if "keywords" not in result:
-            result["keywords"] = []
-        return result
-    except (asyncio.TimeoutError, httpx.TimeoutException):
-        ai_logger.warning(f"Timeout describing image {file_name}. Using smart fallback.")
-        # Re-raise so indexer.py knows it timed out and skips or handles it
-        raise Exception("Indexing timeout")
-    except Exception as e:
-        ai_logger.error(f"[LLM] Error describing image {file_name}: {e}")
-        # Smart fallback: derive keywords from filename
-        name_stem = os.path.splitext(file_name)[0]
-        ext = os.path.splitext(file_name)[1].lstrip('.')
-        fallback_keywords = [file_name, name_stem]
-        if ext:
-            fallback_keywords.append(ext)
+EXTREMELY IMPORTANT: STOP GENERATING immediately after the closing brace "}}". Do not append any trailing text."""
+
+    ai_logger.info(f"Describing image {file_name}...")
+    for attempt in range(2):
+        try:
+            # 25s timeout per attempt for vision
+            response = await _chat(prompt, image_path=image_path, num_predict=600, timeout=25.0)
+            result = _parse_json_response(response)
             
-        # Extract camelCase or snake_case chunks from filename
-        words = re.findall(r'[a-zA-Z0-9]+', name_stem.replace('_', ' ').replace('-', ' '))
-        fallback_keywords.extend([w.lower() for w in words if len(w) > 2])
+            # Basic validation
+            if not result.get("summary") and not result.get("keywords"):
+                raise Exception("LLM returned empty or unparseable result")
 
-        return {
-            "summary": f"Image file: {file_name} — AI description unavailable (Model timed out).",
-            "keywords": list(dict.fromkeys(fallback_keywords))
-        }
+            if "summary" not in result:
+                result["summary"] = ""
+            if "keywords" not in result:
+                result["keywords"] = []
+            return result
+        except Exception as e:
+            ai_logger.warning(f"[Attempt {attempt+1}/2] Error describing image {file_name}: {e}")
+            if attempt == 0:
+                ai_logger.info(f"Retrying {file_name}...")
+                continue
+            # Both attempts failed — raise to prevent database pollution
+            raise LLMFailedError(f"describe_image failed for '{file_name}' after 2 attempts") from e
 
 
 async def expand_query(user_query: str) -> str:
@@ -473,28 +469,36 @@ async def expand_query(user_query: str) -> str:
     Expand a natural language query into comprehensive English search keywords.
     Returns a space-separated string of keywords for Elasticsearch search.
     """
-    prompt = f"""You are a file search assistant. The user typed a natural language query and you must extract precise English search keywords to find matching files on their computer.
+    user_query = user_query.strip()
+
+    prompt = f"""You are a file search assistant. The user typed a query and you must extract precise English search keywords to find matching files on their computer.
 
 USER QUERY: "{user_query}"
 
 STEPS:
 1. Understand the user's TRUE INTENT.
 2. If the query is not in English, TRANSLATE IT to its exact English equivalent first.
-3. Identify the CORE CONCEPT: the most specific search term(s) that would directly match the file.
-4. Add 5-10 closely related synonyms or specific sub-topics.
+3. Include BOTH the common short name AND the full scientific/official name for any animal, place, or concept.
+4. Add 3-5 closely related synonyms or specific sub-topics.
 
 EXAMPLES:
-- "二分搜" → binary search bisect sorted array O(log n) divide conquer
-- "海邊照片" → beach ocean sea coast shoreline waves sand sunset seaside
+- "二分搜" → binary search bisect sorted array divide conquer
+- "海邊照片" → beach ocean sea coast shoreline waves sand seaside
 - "Python 遞迴" → recursion recursive function Python base case call stack
 - "菲律賓" → Philippines Filipino Manila island southeast asia tropical
+- "河馬" → hippo hippopotamus water animal Africa river mammal zoo
+- "hippo" → hippo hippopotamus river mammal Africa water zoo wildlife
+- "cat" → cat kitten feline tabby cat domestic animal pet
+- "大象" → elephant mammal Africa Asia trunk ivory wildlife zoo safari
 
 CRITICAL RULES:
 - ENTIRE OUTPUT MUST BE IN ENGLISH. No Chinese characters allowed in output.
 - The DIRECT ENGLISH TRANSLATION of the user's core concept MUST be the very first word(s).
 - Output ONLY a single line of space-separated English keywords. No explanations, no commas.
-- Select the most critical keywords, MAXIMUM 50 keywords. Each keyword MUST be concise (under 30 characters). QUALITY over quantity. DO NOT repeat words.
-- Prioritize SPECIFIC terms over generic ones. Avoid: "file", "data", "picture"."""
+- Select the most critical keywords, MAXIMUM 10 keywords. QUALITY over quantity.
+- For animals/places, ALWAYS include BOTH the specific name AND the general category (e.g. "Dachshund" AND "dog", "hippo" AND "mammal").
+- ABSOLUTELY NO REPETITIVE LOOPS. Each word MUST be unique!
+- Prioritize SPECIFIC terms over generic ones. Avoid: "file", "data", "picture", "photo", "image"."""
 
     try:
         response = await _chat(prompt, num_predict=300)
@@ -516,10 +520,22 @@ CRITICAL RULES:
         # Remove common prefixes LLMs might add
         keywords = re.sub(r'^(keywords:|answer:|result:|here are the keywords:)\s*', '', keywords, flags=re.IGNORECASE)
 
+        # Truncate and deduplicate words to prevent infinite repetition loops
+        words = keywords.split()
+        seen = set()
+        deduped = []
+        for w in words:
+            wl = w.lower()
+            if wl not in seen:
+                seen.add(wl)
+                deduped.append(w)
+                
+        keywords = ' '.join(deduped[:30])
+        
         # Truncate to 1500 chars at word boundary to avoid overly long search queries
         keywords = _truncate_keywords(keywords, max_chars=1500)
 
-        return keywords
+        return str(keywords)
     except Exception as e:
         print(f"[LLM] Error expanding query: {e}")
         return user_query

@@ -1,0 +1,3 @@
+以下檔案多次產生索引失敗（可能 LLM 伺服器超載或超時），已自動跳過：
+- C:/Users/User/Downloads/Animals_Pexels_HD-20260313T111523Z-3-001\Animals_Pexels_HD\rename_files.py
+- C:/Users/User/Downloads/Animals_Pexels_HD-20260313T111523Z-3-001\Animals_Pexels_HD\rename_log.txt

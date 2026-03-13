@@ -99,6 +99,25 @@ def _ensure_index():
         return
 
     if es.indices.exists(index=ES_INDEX):
+        # Try to update existing mapping to enable fielddata if it wasn't already
+        try:
+            es.indices.put_mapping(index=ES_INDEX, body={
+                "properties": {
+                    "keywords": {
+                        "type": "text",
+                        "analyzer": "keyword_analyzer",
+                        "fielddata": True,
+                        "fields": {
+                            "full": {
+                                "type": "text",
+                                "analyzer": "file_analyzer"
+                            }
+                        }
+                    }
+                }
+            })
+        except Exception:
+            pass # Ignore if mapping update is not allowed/fails
         return
 
     es.indices.create(index=ES_INDEX, body={
@@ -131,8 +150,9 @@ def _ensure_index():
                 "file_name":     {"type": "text", "analyzer": "file_analyzer"},
                 "summary":       {"type": "text", "analyzer": "file_analyzer"},
                 "keywords":      {
-                    "type": "text",
+                    "type": "text", 
                     "analyzer": "keyword_analyzer",
+                    "fielddata": True,  # Enable for script-based scoring (ratio calculation)
                     "fields": {
                         "full": {
                             "type": "text",
@@ -348,63 +368,145 @@ def _search_es(query: str, limit: int = 20) -> list[dict]:
         }
     else:
         # Improved multi-match strategy for long conceptual queries
-        body = {
-            "size": limit,
-            "min_score": 0.5,   # Filter out low-relevance results
-            "query": {
-                "bool": {
-                    "should": [
-                        # 1. Exact phrase match across important fields (Priority 1)
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": ["file_name^10", "keywords^8", "summary^5"],
-                                "type": "phrase",
-                                "boost": 5.0
-                            }
-                        },
-                        # 2. Keyword full-text match — preserves multi-word terms (Priority 2)
-                        {
-                            "match": {
-                                "keywords.full": {
-                                    "query": query,
-                                    "operator": "or",
-                                    "minimum_should_match": "40%",
-                                    "boost": 3.0
-                                }
-                            }
-                        },
-                        # 3. Comma-tokenized keyword match — exact multi-word keyword phrases (Priority 2b)
-                        {
-                            "match": {
-                                "keywords": {
-                                    "query": query,
-                                    "operator": "or",
-                                    "minimum_should_match": "40%",
-                                    "boost": 2.5
-                                }
-                            }
-                        },
-                        # 4. Broad cross-field search (Priority 3)
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": ["file_name^3", "summary^2", "raw_text"],
-                                "type": "cross_fields",
-                                "operator": "or",
-                                "minimum_should_match": "30%",
-                                "boost": 1.0
-                            }
-                        }
-                    ],
-                    "minimum_should_match": 1
+        words = query.lower().split()
+        # For short queries (1-3 words), require fewer matches. For longer ones, require more.
+        min_match = "1" if len(words) <= 3 else "30%"
+
+        should_clauses = [
+            # 1. Precise match on keywords (Priority 1)
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["keywords^15", "file_name^12"],
+                    "type": "best_fields",
+                    "boost": 25.0,
+                    "tie_breaker": 0.3
                 }
             },
+            # 2. Phrase match on expanded keywords (Priority 2)
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["keywords.full^10"],
+                    "type": "phrase",
+                    "boost": 15.0,
+                    "tie_breaker": 0.3
+                }
+            },
+            # 3. Expanded word matching
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["file_name^5", "keywords.full^5"],
+                    "type": "best_fields",
+                    "operator": "or",
+                    "minimum_should_match": min_match,
+                    "boost": 4.0,
+                    "tie_breaker": 0.3
+                }
+            }
+        ]
+
+        # LLM expands queries such that the actual direct translation/intent is the FIRST word(s).
+        if words:
+            # Massive boost for the CORE CONCEPT (1st word) - Exact match preferred
+            should_clauses.append({
+                "multi_match": {
+                    "query": words[0],
+                    "fields": ["keywords^40", "file_name^30", "keywords.full^20"],
+                    "type": "best_fields",
+                    "boost": 60.0,
+                    "tie_breaker": 0.5
+                }
+            })
+            
+            # Significant boost for the CORE PHRASE (1st & 2nd words together)
+            if len(words) >= 2:
+                should_clauses.append({
+                    "multi_match": {
+                        "query": " ".join(words[:2]),
+                        "fields": ["file_name^20", "keywords.full^20"],
+                        "type": "phrase",
+                        "boost": 30.0,
+                        "tie_breaker": 0.5
+                    }
+                })
+                
+            # Allow slight fuzziness ONLY on the first word to handle typos.
+            should_clauses.append({
+                "multi_match": {
+                    "query": words[0],
+                    "fields": ["file_name^5", "keywords.full^5"],
+                    "type": "best_fields",
+                    "fuzziness": "1",
+                    "boost": 2.0,
+                    "tie_breaker": 0.1
+                }
+            })
+
+    try:
+        # Wrap everything in a function_score to implement the keyword ratio logic
+        # Ratio = (matched_keywords / total_keywords)
+        final_query = {
+            "function_score": {
+                "query": {
+                    "bool": {
+                        "should": should_clauses,
+                        "minimum_should_match": 1
+                    }
+                },
+                "functions": [
+                    {
+                        "script_score": {
+                            "script": {
+                                "source": """
+                                    // Count how many stored keywords match EXACTLY with any query terms
+                                    long matches = 0;
+                                    long total = doc['keywords'].size();
+                                    if (total > 0) {
+                                        for (int i = 0; i < total; i++) {
+                                            String kw = doc['keywords'].get(i).toLowerCase();
+                                            boolean found = false;
+                                            for (String term : params.query_terms) {
+                                                if (kw.equals(term)) {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (found) {
+                                                matches++;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Calculate ratio
+                                    double final_total = (double)Math.max(1, total);
+                                    double ratio = (double)matches / final_total;
+                                    
+                                    // Return a multiplier. If ratio is high, boost VERY significantly.
+                                    // High-density files (like a lion image where 'lion' is its primary tag)
+                                    // will now clearly win over generic 'sea lion' mentions.
+                                    return _score * (1.0 + ratio * 10.0);
+                                """,
+                                "params": {
+                                    "query_terms": words
+                                }
+                            }
+                        }
+                    }
+                ],
+                "boost_mode": "replace"
+            }
+        }
+
+        body = {
+            "size": limit,
+            "min_score": 1.0,
+            "query": final_query,
             "_source": ["file_path", "file_name", "file_type", "file_size",
                          "summary", "keywords", "modified_time"],
         }
 
-    try:
         resp = es.search(index=ES_INDEX, body=body)
         results = []
         for hit in resp["hits"]["hits"]:
@@ -435,15 +537,14 @@ def _search_sqlite_fallback(query: str, limit: int = 20) -> list[dict]:
             conn.close()
             return []
 
-        # Build LIKE conditions for each term
+        # Build conditions for each term - exact matching within comma-separated list
         conditions = []
         params = []
         for term in terms:
-            like = f"%{term}%"
             conditions.append(
-                "(file_name LIKE ? OR summary LIKE ? OR keywords LIKE ?)"
+                "(file_name LIKE ? OR (',' || keywords || ',') LIKE ?)"
             )
-            params.extend([like, like, like])
+            params.extend([f"%{term}%", f"%,{term},%"])
 
         where_clause = " OR ".join(conditions)
         rows = conn.execute(f"""

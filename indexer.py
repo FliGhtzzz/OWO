@@ -88,6 +88,7 @@ async def index_file(file_path: str) -> bool:
     """
     Index a single file: parse -> LLM -> database.
     Returns True if successful, False otherwise.
+    Raises: LLMFailedError if LLM fails (to be caught by index_folder)
     """
     try:
         file_path = os.path.normpath(file_path)
@@ -104,12 +105,11 @@ async def index_file(file_path: str) -> bool:
         category = get_file_category(file_path)
 
         if category == "image":
-            # Vision model handles its own timeout and fallback
+            # Vision model handles its own internal retry
             result = await describe_image(file_path, file_name)
             raw_text = ""
         elif category == "document":
             # Hybrid approach: extract text + extract images, send both to LLM
-            # (Note: _index_document also calls extract_keywords/describe_image which handle their own timeouts)
             result = await _index_document(file_path, file_name)
             raw_text = ""
             # Also try to get raw text for search
@@ -136,25 +136,45 @@ async def index_file(file_path: str) -> bool:
                 return True
 
             raw_text = text_content
-            # Text model handles its own timeout and fallback
+            # Text model handles its own internal retry
             result = await extract_keywords(text_content, file_name)
             ai_logger.info(f"[Indexer] {file_name}: Extracted {len(result.get('keywords', []))} keywords.")
 
-        # Store in database — use comma-separated keywords to preserve multi-word terms
-        keywords_list = result.get("keywords", [])
-        keywords_str = ", ".join(keywords_list)
-        ai_logger.info(f"[Indexer] {file_name}: Saving to DB. Summary len={len(result.get('summary', ''))}")
+        # ── Final sanitisation before writing to DB ──────────────────────
+        # 1. Deduplicate keywords (case-insensitive), keep order, cap at 50
+        raw_kw_list = result.get("keywords", [])
+        seen_kw: set[str] = set()
+        deduped_kw: list[str] = []
+        for kw in raw_kw_list:
+            kw_clean = str(kw).strip()
+            kl = kw_clean.lower()
+            if kl and kl not in seen_kw:
+                seen_kw.add(kl)
+                deduped_kw.append(kw_clean)
+            if len(deduped_kw) >= 50:
+                break
+        keywords_str = ", ".join(deduped_kw)
+
+        # 2. Truncate summary to 600 chars at a sentence boundary if possible
+        raw_summary = result.get("summary", "")
+        if len(raw_summary) > 600:
+            truncated = raw_summary[:600]
+            last_period = truncated.rfind(".")
+            raw_summary = (truncated[:last_period + 1] if last_period > 300 else truncated).strip()
+
+        ai_logger.info(f"[Indexer] {file_name}: Saving to DB. summary={len(raw_summary)} chars, keywords={len(deduped_kw)}")
         upsert_file(
             file_path=file_path,
             file_name=file_name,
             file_type=file_type,
             file_size=file_size,
             modified_time=modified_time,
-            summary=result.get("summary", ""),
+            summary=raw_summary,
             keywords=keywords_str,
             raw_text=raw_text if category != "image" else "",
         )
         return True
+
 
     except Exception as e:
         print(f"[Indexer] Error indexing {file_path}: {e}")
@@ -179,6 +199,7 @@ async def _index_document(file_path: str, file_name: str) -> dict:
             print(f"[Indexer] {file_name}: extracted {len(text_result.get('keywords', []))} text keywords")
         except Exception as e:
             print(f"[Indexer] Error extracting text keywords from {file_name}: {e}")
+            raise e # Strict: if part of it fails, let index_file handle retry
 
     # Step 2: Image extraction → Vision LLM
     image_paths = []
@@ -193,8 +214,7 @@ async def _index_document(file_path: str, file_name: str) -> dict:
                     results.append(img_result)
                 except Exception as e:
                     print(f"[Indexer] Error describing image {i+1} from {file_name}: {e}")
-    except Exception as e:
-        print(f"[Indexer] Error extracting images from {file_name}: {e}")
+                    raise e # Strict indexing
     finally:
         # Clean up temp images
         cleanup_temp_images(image_paths)
@@ -240,8 +260,11 @@ async def index_folder(folder_path: str):
         except ImportError:
             pass
 
-        # Index files one by one (local LLM = sequential is better)
-        ai_logger.info(f"[Indexer] Starting to index {len(files)} files in {folder_path}")
+        # Three-pass indexing strategy
+        failed_files = []
+        
+        # Pass 1: Initial Attempt
+        ai_logger.info(f"[Indexer] PASS 1: Indexing {len(files)} files...")
         for i, file_path in enumerate(files):
             if indexing_state.get("cancel"):
                 ai_logger.info("[Indexer] Indexing cancelled.")
@@ -250,9 +273,54 @@ async def index_folder(folder_path: str):
             indexing_state["current_file"] = os.path.basename(file_path)
             indexing_state["processed_files"] = i
 
-            success = await index_file(file_path)
-            if not success:
-                indexing_state["errors"].append(file_path)
+            try:
+                success = await index_file(file_path)
+                if not success:
+                    failed_files.append(file_path)
+            except Exception as e:
+                ai_logger.warning(f"[Indexer] {os.path.basename(file_path)} failed Pass 1: {e}")
+                failed_files.append(file_path)
+
+        # Pass 2: Retry Failed Files
+        if failed_files and not indexing_state.get("cancel"):
+            ai_logger.info(f"[Indexer] PASS 2: Retrying {len(failed_files)} failed files...")
+            indexing_state["current_file"] = f"Retry Pass 2 ({len(failed_files)} files)..."
+            still_failed = []
+            for file_path in failed_files:
+                if indexing_state.get("cancel"): break
+                try:
+                    if await index_file(file_path):
+                        continue
+                    still_failed.append(file_path)
+                except Exception:
+                    still_failed.append(file_path)
+            failed_files = still_failed
+
+        # Pass 3: Final Retry
+        if failed_files and not indexing_state.get("cancel"):
+            ai_logger.info(f"[Indexer] PASS 3: Final retry for {len(failed_files)} files...")
+            indexing_state["current_file"] = f"Final Retry Pass 3 ({len(failed_files)} files)..."
+            still_failed = []
+            for file_path in failed_files:
+                if indexing_state.get("cancel"): break
+                try:
+                    if await index_file(file_path):
+                        continue
+                    still_failed.append(file_path)
+                except Exception:
+                    still_failed.append(file_path)
+            
+            if still_failed:
+                ai_logger.error(f"[Indexer] Failed to process {len(still_failed)} files after 3 passes.")
+                from llm import ai_log_file
+                msg = f"注意：有 {len(still_failed)} 個檔案多次重試後仍無法索引，已跳過以避免污然資料庫。"
+                indexing_state["errors"].append(msg)
+                
+                # Write to failed_files.txt
+                with open(os.path.join(os.path.dirname(ai_log_file), "failed_files.txt"), "w", encoding="utf-8") as f:
+                    f.write("以下檔案多次產生索引失敗（可能 LLM 伺服器超載或超時），已自動跳過：\n")
+                    for fn in still_failed:
+                        f.write(f"- {fn}\n")
 
         indexing_state["processed_files"] = len(files)
         indexing_state["current_file"] = "Done!"
